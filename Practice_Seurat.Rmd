@@ -1,0 +1,200 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Step 0: Installing Required Packages
+
+install.packages("hdf5r") is ran.
+
+```{r}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+library(SingleCellExperiment)
+library(edgeR)
+```
+
+# Step 1: Getting Data
+
+```{r}
+webpath <- "https://raw.githubusercontent.com/NBISweden/workshop-scRNAseq/new_dataset/labs/data/covid_data_GSE149689/sub/"
+dir.create("./data/raw", recursive = T) 
+```
+
+```{r}
+file_list <- c("Normal_PBMC_13.h5", "Normal_PBMC_14.h5", "Normal_PBMC_5.h5", "nCoV_PBMC_15.h5",
+    "nCoV_PBMC_17.h5", "nCoV_PBMC_1.h5")
+for (i in file_list) {
+    download.file(url = paste0(webpath, i), destfile = paste0("./data/raw/", i))
+}
+```
+
+```{r}
+cov.15 <- Seurat::Read10X_h5(filename = "data/raw/nCoV_PBMC_15.h5", use.names = T)
+cov.1 <- Seurat::Read10X_h5(filename = "data/raw/nCoV_PBMC_1.h5", use.names = T)
+cov.17 <- Seurat::Read10X_h5(filename = "data/raw/nCoV_PBMC_17.h5", use.names = T)
+
+ctrl.5 <- Seurat::Read10X_h5(filename = "data/raw/Normal_PBMC_5.h5", use.names = T)
+ctrl.13 <- Seurat::Read10X_h5(filename = "data/raw/Normal_PBMC_13.h5", use.names = T)
+ctrl.14 <- Seurat::Read10X_h5(filename = "data/raw/Normal_PBMC_14.h5", use.names = T)
+```
+
+Observations: - for each of these objects (cov.15, cov.1, cov.17,...), there are genes for each row and RNA sequences (CTCCATGTCAACGTGT-15, CATAAGCAGGAACGAA-15 --\> ?) on each columns.
+
+# Create One merged Object
+
+```{r}
+sdata.cov15 <- CreateSeuratObject(cov.15, project = "covid_15")
+sdata.cov1 <- CreateSeuratObject(cov.1, project = "covid_1")
+sdata.cov17 <- CreateSeuratObject(cov.17, project = "covid_17")
+sdata.ctrl5 <- CreateSeuratObject(ctrl.5, project = "ctrl_5")
+sdata.ctrl13 <- CreateSeuratObject(ctrl.13, project = "ctrl_13")
+sdata.ctrl14 <- CreateSeuratObject(ctrl.14, project = "ctrl_14")
+
+# add metadata
+sdata.cov1$type = "Covid"
+sdata.cov15$type = "Covid"
+sdata.cov17$type = "Covid"
+sdata.ctrl5$type = "Control"
+sdata.ctrl13$type = "Control"
+sdata.ctrl14$type = "Control"
+
+# Merge datasets into one single seurat object
+alldata <- merge(sdata.cov15, c(sdata.cov1, sdata.cov17, sdata.ctrl5, sdata.ctrl13,
+    sdata.ctrl14), add.cell.ids = c("covid_15", "covid_1", "covid_17", "ctrl_5",
+    "ctrl_13", "ctrl_14"))
+```
+
+```{r}
+# remove all objects that will not be used.
+rm(cov.15, cov.1, cov.17, ctrl.5, ctrl.13, ctrl.14, sdata.cov15, sdata.cov1, sdata.cov17,
+    sdata.ctrl5, sdata.ctrl13, sdata.ctrl14)
+
+# run garbage collect to free up memory
+gc()
+```
+
+```{r}
+as.data.frame(alldata@assays$RNA@counts[1:10, 1:2])
+head(alldata@meta.data, 10)
+```
+
+# Quality Control
+
+Calculate the percentage of mitocondrial and ribosomal genes per cell and add to the metadata. This will be helpfull to visualize them across different metadata parameteres (i.e. datasetID and chemistry version).
+
+```{r}
+total_counts_per_cell <- colSums(alldata@assays$RNA@counts)
+mito_genes <- rownames(alldata)[grep("^MT-", rownames(alldata))]
+alldata$percent_mito <- colSums(alldata@assays$RNA@counts[mito_genes, ])/total_counts_per_cell
+
+head(mito_genes, 10)
+
+```
+
+```{r}
+# Calculating ribosomal genes
+ribo_genes <- rownames(alldata)[grep("^RP[SL]", rownames(alldata))]
+head(ribo_genes, 10)
+alldata$percent_ribo <- colSums(alldata@assays$RNA@counts[ribo_genes, ])/total_counts_per_cell
+
+```
+
+```{r}
+# Percentage hemoglobin genes - includes all genes starting with HB except HBP.
+alldata <- PercentageFeatureSet(alldata, "^HB[^(P)]", col.name = "percent_hb")
+alldata <- PercentageFeatureSet(alldata, "PECAM1|PF4", col.name = "percent_plat")
+```
+
+So,for these quality control procedure, we calculated what percentage of each genes are ribosomal, hemoglobin genes, mitochondrial genes for each cell.
+
+# Plotting Quality Control 
+
+```{r}
+feats <- c("nFeature_RNA", "nCount_RNA", "percent_mito", "percent_ribo", "percent_hb")
+
+VlnPlot(alldata, group.by = "orig.ident", features = feats, pt.size = 0.1, ncol = 3) +
+    NoLegend()
+
+```
+
+-   nFeatureRNA: Represents the number of unique genes detected in each cell's transcriptome. A higher nFeatureRNA indicates that the cell expresses a larger number of genes. In a QC plot, cells with low nFeatureRNA values are often filtered out, as they may represent low-quality cells or cells with poor RNA capture efficiency.
+
+```{=html}
+<!-- -->
+```
+-   ncountRNA: Represents the total number of RNA molecules detected in each cell's transcriptome. A higher ncountRNA indicates that more RNA molecules were sequenced from the cell, which may indicate a higher-quality cell or more sequencing depth. In a QC plot, cells with low ncountRNA values may also be filtered out if the dataset has a high level of technical noise or if the cells have poor RNA capture efficiency.
+
+-   percent_mitochondrial gene: Represents the percentage of reads that align to mitochondrial genes in each cell's transcriptome. A higher percentage of mitochondrial genes may indicate that the cell is stressed or damaged, and therefore has increased mitochondrial gene expression. In a QC plot, cells with high percent mitochondrial gene values are often filtered out, as they may represent low-quality cells or cells with high levels of technical noise.
+
+-   percent ribosomal gene: Represents the percentage of reads that align to ribosomal genes in each cell's transcriptome. Ribosomal genes are highly expressed in all cells, but a high percentage of ribosomal genes may indicate poor RNA quality or contamination. In a QC plot, cells with high percent ribosomal gene values are often filtered out, as they may represent low-quality cells or cells with high levels of technical noise.
+
+-   percent hemoglobin genes: Represents the percentage of reads that align to hemoglobin genes in each cell's transcriptome. Hemoglobin genes are highly expressed in blood cells, but not in other cell types. In a QC plot, cells with high percent hemoglobin gene values may indicate a higher percentage of blood cells in the dataset. Depending on the experimental design, these cells may be filtered out or analyzed separately.
+
+## Interpretation of these quality control plots: 
+
+-   Covid_15 has lower nFeature RNA than other samples, which indicates that covid_15 sample has low quality cells or cells with poor RNA capture efficiency. However, its difference with other cells is not so big that it seems like we don\'t necessarily have to remove it from our analysis. It is also interesting to notice that Percent_mitochondrial genes of covid 15 are bigger than other samples. Since a higher percentage of mitochondrial genes indicate that the cell is stressed, it makes sense that Covid_15 have high nFeature_RNA and percent_mitochondrial.
+
+-   Covid_1 and Control 14 have higher percent hemoglobin than other samples. This may indicate that there is a higher percentage of blood cells in these samples. Depending on the experimental design, we might have to consider removing them from our study. 
+
+```{r}
+FeatureScatter(alldata, "nCount_RNA", "nFeature_RNA", group.by = "orig.ident", pt.size = 0.5)
+```
+
+```{r}
+FeatureScatter(alldata, "nCount_RNA", "percent_mito", group.by = "orig.ident", pt.size = 0.5)
+```
+
+# Filtering Cells 
+
+```{r}
+# filtering cells that have low feature RNA.
+# There are 33538 cells, but then we narrowed down to 18147 cells 
+selected_c <- WhichCells(alldata, expression = nFeature_RNA > 200)
+# filtering out genes that don't have certain number of counts across different cells. Including genes that are present in more than three cells.
+# There are 9000 genes, but then we narrowed down to 7973 genes  
+selected_f <- rownames(alldata)[Matrix::rowSums(alldata) > 3]
+
+data.filt <- subset(alldata, features = selected_f, cells = selected_c)
+dim(data.filt) 
+```
+
+This is a step to calculate the relative expression of each gene.
+
+Function Description
+
+-   Matrix::t(Matrix::t(C)/Matrix::colSums(C)) \* 100
+
+    -   **`Matrix::colSums(C)`** calculates the total count for each column of the matrix **`C`**. This is a vector with the same number of columns as **`C`**.
+
+    -   **`Matrix::t(C)`** transposes the matrix **`C`**.
+
+    -   **`Matrix::t(C)/Matrix::colSums(C)`** divides each element of the transposed matrix **`C`** by the corresponding value in the vector of total counts. This results in a matrix where each column has been normalized by the total count of that column.
+
+    -   **`Matrix::t(Matrix::t(C)/Matrix::colSums(C))`** transposes the normalized matrix back to its original orientation.
+
+    -   **`* 100`** multiplies each element of the normalized matrix by 100.
+
+```{r}
+# Compute the relative expression of each gene per cell Use sparse matrix
+# operations, if your dataset is large, doing matrix devisions the regular way
+# will take a very long time.
+par(mar = c(4, 8, 2, 1))
+C <- data.filt@assays$RNA@counts
+C <- Matrix::t(Matrix::t(C)/Matrix::colSums(C)) * 100
+most_expressed <- order(apply(C, 1, median), decreasing = T)[20:1]
+
+```
+
+```{r}
+boxplot(as.matrix(t(C[most_expressed, ])), cex = 0.1, las = 1, xlab = "% total count per cell",
+    col = (scales::hue_pal())(20)[20:1], horizontal = TRUE)
+```
+
+-   MT-CO3 is a gene that encodes a subunit of the mitochondrial cytochrome c oxidase enzyme, also known as Complex IV. This enzyme plays a key role in the mitochondrial respiratory chain, which is responsible for generating ATP, the main source of energy for the cell. 
+
+-   EEF1A1 is a gene that encodes for the eukaryotic elongation factor 1 alpha 1 (eEF1A1) protein. This protein is a highly conserved cytoplasmic protein that plays a critical role in protein translation, specifically during the elongation phase of protein synthesis.
+
+\
